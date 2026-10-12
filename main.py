@@ -148,7 +148,7 @@ def prompt_start_time(initial_value: str | None = None) -> datetime:
 
     while True:
         try:
-            user_start = input("Enter start date and time (YYYY-MM-DD HH:MM): ").strip()
+            user_start = input("Enter start date and time[in UTC] (YYYY-MM-DD HH:MM): ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nOperation cancelled.")
             sys.exit(0)
