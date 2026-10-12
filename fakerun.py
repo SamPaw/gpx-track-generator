@@ -1,306 +1,289 @@
-import argparse
+"""fakerun.py - Core GPX Running Simulation Engine.
+
+This module contains the actual working logic for:
+  1. Parsing GPX route tracks and extracting GPS coordinates.
+  2. Great-circle distance calculations using the Haversine formula.
+  3. Continuous spatial interpolation along multi-point routes.
+  4. Realistic running simulation with pace drift and optional pauses.
+  5. GPX 1.1 XML generation compatible with Strava, Garmin, and others.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import bisect
 import math
 import os
-import random
-import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import random
 import xml.etree.ElementTree as ET
 
-# Pre-declared defaults
-DEFAULT_PACE_MIN_PER_KM = 6.0                                # default average pace (min/km)
-DEFAULT_STOP_SECONDS = (40, 120)                             # duration range (seconds) for each pause if pauses > 0
+# ---------------------------------------------------------------------------
+# Default Configuration Constants
+# ---------------------------------------------------------------------------
+DEFAULT_PACE_MIN_PER_KM: float = 6.0                 # Default target pace: 6.0 min/km
+DEFAULT_STOP_SECONDS: tuple[int, int] = (40, 120)    # Duration range (seconds) for each pause
+EARTH_RADIUS_METERS: float = 6371000.0               # Mean radius of the Earth in meters
 
 
-def clean_path(path_str: str) -> str:
-    """Clean quotation marks and extra whitespace from path input."""
-    if not path_str:
-        return ""
-    path_str = path_str.strip()
-    if (path_str.startswith('"') and path_str.endswith('"')) or (
-        path_str.startswith("'") and path_str.endswith("'")
-    ):
-        path_str = path_str[1:-1].strip()
-    return path_str
+@dataclass
+class SimulationResult:
+    """Summary of the generated GPX run activity."""
+    output_path: Path
+    activity_name: str
+    total_distance_km: float
+    elapsed_time: timedelta
+    total_points: int
+    start_time: datetime
+    pace_min_per_km: float
+    stops_count: int
 
 
-def parse_start_time(time_str: str) -> datetime:
-    """Parse start date and time from user input into a UTC-aware datetime."""
-    time_str = time_str.strip()
-    # Try ISO-like parsing first
-    try:
-        dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        pass
+def haversine_distance(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
+    """Calculate the great-circle distance between two points on Earth in meters.
 
-    # Try common user-friendly formats
-    formats = [
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%Y/%m/%d %H:%M:%S",
-        "%d-%m-%Y %H:%M",
-        "%d/%m/%Y %H:%M",
-        "%Y-%m-%d %I:%M %p",
-        "%Y-%m-%d %I:%M%p",
-    ]
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(time_str, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
+    Parameters:
+        coord1: (latitude, longitude) of point 1 in degrees.
+        coord2: (latitude, longitude) of point 2 in degrees.
 
-    raise ValueError(
-        "Unrecognized format. Please use 'YYYY-MM-DD HH:MM' (e.g. 2026-10-12 06:30)."
-    )
+    Returns:
+        Distance in meters.
+    """
+    lat1, lon1, lat2, lon2 = map(math.radians, (coord1[0], coord1[1], coord2[0], coord2[1]))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    c = 2.0 * math.asin(math.sqrt(a))
+    return EARTH_RADIUS_METERS * c
 
 
-def get_parameters():
-    """Prompt user for target file, output file, start time, pace, and pauses (or read CLI flags)."""
-    parser = argparse.ArgumentParser(
-        description="Generate a realistic faked GPX running activity from a target route GPX."
-    )
-    parser.add_argument("src", nargs="?", help="Target GPX filename/path (input route)")
-    parser.add_argument("dst", nargs="?", help="Output GPX filename/path")
-    parser.add_argument("-t", "--target", dest="target_flag", help="Target GPX filename/path")
-    parser.add_argument("-o", "--out", dest="out_flag", help="Output GPX filename/path")
-    parser.add_argument("-s", "--start", dest="start_flag", help="Start date & time (e.g. '2026-10-12 06:30')")
-    parser.add_argument("-p", "--pace", dest="pace_flag", type=float, help="Pace in min/km (default: 6.0)")
-    parser.add_argument("--stops", "--pauses", dest="stops_flag", type=int, help="Number of pauses (default: 0)")
-    args = parser.parse_args()
+def parse_gpx_points(gpx_path: str | Path) -> list[tuple[float, float]]:
+    """Parse track or route points from an input GPX file.
 
-    # 1. Target file selection
-    src = clean_path(args.target_flag or args.src)
-    if not src:
-        while True:
-            try:
-                user_src = input("Enter target GPX filename (input route): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nOperation cancelled.")
-                sys.exit(0)
+    Parameters:
+        gpx_path: Path to the input GPX file.
 
-            user_src = clean_path(user_src)
-            if not user_src:
-                print("Error: Target filename cannot be empty. Please try again.")
-                continue
-            if not os.path.isfile(user_src):
-                print(f"Error: Target file '{user_src}' not found. Please try again.")
-                continue
-            src = user_src
-            break
-    else:
-        if not os.path.isfile(src):
-            print(f"Error: Target file '{src}' does not exist.")
-            sys.exit(1)
+    Returns:
+        List of (latitude, longitude) tuples.
 
-    # 2. Output file selection
-    target_path = Path(src)
-    default_dst_name = f"{target_path.stem}_fake.gpx"
-    default_dst = target_path.with_name(default_dst_name)
+    Raises:
+        FileNotFoundError: If the input file does not exist.
+        ET.ParseError: If the GPX file contains invalid XML.
+        ValueError: If fewer than 2 coordinates are found in the GPX file.
+    """
+    path_obj = Path(gpx_path)
+    if not path_obj.is_file():
+        raise FileNotFoundError(f"Target GPX file not found: {gpx_path}")
 
-    dst = clean_path(args.out_flag or args.dst)
-    if not dst:
-        try:
-            prompt = f"Enter output GPX filename [default: {default_dst_name}]: "
-            user_dst = input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nOperation cancelled.")
-            sys.exit(0)
-
-        user_dst = clean_path(user_dst)
-        if not user_dst:
-            dst = str(default_dst)
-        else:
-            dst_path = Path(user_dst)
-            if not dst_path.suffix:
-                dst_path = dst_path.with_suffix(".gpx")
-            dst = str(dst_path)
-    else:
-        dst_path = Path(dst)
-        if not dst_path.suffix:
-            dst = str(dst_path.with_suffix(".gpx"))
-
-    # 3. Start date and time (kept empty at first for user to enter)
-    start_dt = None
-    if args.start_flag:
-        try:
-            start_dt = parse_start_time(args.start_flag)
-        except ValueError as e:
-            print(f"Error in --start argument: {e}")
-            sys.exit(1)
-    else:
-        while True:
-            try:
-                user_start = input("Enter start date and time (YYYY-MM-DD HH:MM): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nOperation cancelled.")
-                sys.exit(0)
-
-            if not user_start:
-                print("Error: Start date and time is required. Example: 2026-10-12 06:30")
-                continue
-
-            try:
-                start_dt = parse_start_time(user_start)
-                break
-            except ValueError as e:
-                print(f"Error: {e}")
-
-    # 4. Target pace (pre-declared default of 6.0, option for user to change)
-    if args.pace_flag is not None:
-        pace = float(args.pace_flag)
-    else:
-        while True:
-            try:
-                user_pace = input(f"Enter target pace in min/km [default: {DEFAULT_PACE_MIN_PER_KM}]: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nOperation cancelled.")
-                sys.exit(0)
-
-            if not user_pace:
-                pace = DEFAULT_PACE_MIN_PER_KM
-                break
-
-            try:
-                val = float(user_pace)
-                if val <= 0:
-                    print("Error: Pace must be greater than 0.")
-                    continue
-                pace = val
-                break
-            except ValueError:
-                print("Error: Please enter a valid number for pace (e.g. 5.5).")
-
-    # 5. Pauses (kept empty at first, if empty initialize as 0 pauses, else use value)
-    if args.stops_flag is not None:
-        stops = int(args.stops_flag)
-    else:
-        while True:
-            try:
-                user_stops = input("Enter number of pauses (leave empty for 0): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nOperation cancelled.")
-                sys.exit(0)
-
-            if not user_stops:
-                stops = 0
-                break
-
-            try:
-                val = int(user_stops)
-                if val < 0:
-                    print("Error: Number of pauses cannot be negative.")
-                    continue
-                stops = val
-                break
-            except ValueError:
-                print("Error: Please enter a valid whole number for pauses.")
-
-    return src, dst, start_dt, pace, stops
-
-
-def dist(a, b):
-    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
-    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
-    return 6371000 * 2 * math.asin(math.sqrt(h))
-
-
-def main():
-    src, dst, start_dt, pace, stops = get_parameters()
-
-    print(f"\n--- Simulation Settings ---")
-    print(f"Target Route File: {src}")
-    print(f"Output GPX File  : {dst}")
-    print(f"Start Time (UTC) : {start_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"Target Pace      : {pace:.2f} min/km")
-    print(f"Number of Pauses : {stops}")
-    print(f"---------------------------")
-
-    try:
-        root = ET.parse(src).getroot()
-    except Exception as e:
-        print(f"Error reading GPX XML from '{src}': {e}")
-        sys.exit(1)
-
-    pts = [
+    root = ET.parse(path_obj).getroot()
+    points = [
         (float(p.get("lat")), float(p.get("lon")))
         for p in root.iter()
         if p.tag.endswith("trkpt") or p.tag.endswith("rtept")
     ]
 
-    if len(pts) < 2:
-        print(f"Error: Found {len(pts)} track/route points in '{src}'. At least 2 points are required.")
-        sys.exit(1)
-
-    cum = [0.0]
-    for i in range(1, len(pts)):
-        cum.append(cum[-1] + dist(pts[i - 1], pts[i]))
-    total = cum[-1]
-
-    def at(d):
-        i = min(bisect.bisect_right(cum, d) - 1, len(pts) - 2)
-        seg = cum[i + 1] - cum[i]
-        f = 0 if seg == 0 else (d - cum[i]) / seg
-        return (
-            pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f,
-            pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f,
+    if len(points) < 2:
+        raise ValueError(
+            f"GPX file '{gpx_path}' contains {len(points)} points. At least 2 points are required."
         )
 
-    stop_at = (
-        sorted(random.uniform(0.1, 0.9) * total for _ in range(stops))
+    return points
+
+
+def interpolate_coordinate(
+    points: list[tuple[float, float]],
+    cumulative_distances: list[float],
+    target_distance: float,
+) -> tuple[float, float]:
+    """Calculate the exact (latitude, longitude) at a target distance along the track.
+
+    Uses binary search (`bisect_right`) to locate the relevant segment, followed by
+    linear interpolation between the segment's two endpoints.
+
+    Parameters:
+        points: Ordered list of track (lat, lon) coordinates.
+        cumulative_distances: Cumulative distance in meters from the start to each point.
+        target_distance: Traveled distance along the route in meters.
+
+    Returns:
+        Interpolated (latitude, longitude) tuple.
+    """
+    idx = min(bisect.bisect_right(cumulative_distances, target_distance) - 1, len(points) - 2)
+    seg_length = cumulative_distances[idx + 1] - cumulative_distances[idx]
+
+    factor = 0.0 if seg_length == 0 else (target_distance - cumulative_distances[idx]) / seg_length
+    lat = points[idx][0] + (points[idx + 1][0] - points[idx][0]) * factor
+    lon = points[idx][1] + (points[idx + 1][1] - points[idx][1]) * factor
+    return lat, lon
+
+
+def simulate_run(
+    points: list[tuple[float, float]],
+    start_time: datetime,
+    pace_min_per_km: float = DEFAULT_PACE_MIN_PER_KM,
+    stops: int = 0,
+    stop_seconds_range: tuple[int, int] = DEFAULT_STOP_SECONDS,
+) -> tuple[list[tuple[datetime, tuple[float, float]]], float, timedelta]:
+    """Simulate a realistic running track with natural pace drift and optional pauses.
+
+    Simulation characteristics:
+      - Pace drift: Speed dynamically drifts smoothly between 85% and 115% of base speed,
+        mimicking human surges, elevation changes, and fatigue.
+      - Pauses: If stops > 0, pause checkpoints are randomly distributed along the route.
+        During each pause, the runner stays stationary while time advances second-by-second.
+
+    Parameters:
+        points: List of route coordinates (lat, lon).
+        start_time: Activity start timestamp (UTC-aware).
+        pace_min_per_km: Target average pace in minutes per kilometer.
+        stops: Number of pauses during the run (0 for none).
+        stop_seconds_range: (min, max) duration range in seconds for each pause.
+
+    Returns:
+        A tuple of:
+          - List of track points: [(timestamp, (lat, lon)), ...]
+          - Total route distance in meters.
+          - Total elapsed activity duration.
+    """
+    # 1. Build cumulative distance array
+    cum_dist = [0.0]
+    for i in range(1, len(points)):
+        cum_dist.append(cum_dist[-1] + haversine_distance(points[i - 1], points[i]))
+    total_dist = cum_dist[-1]
+
+    # 2. Randomly select pause milestones (between 10% and 90% of total distance)
+    stop_milestones = (
+        sorted(random.uniform(0.1, 0.9) * total_dist for _ in range(stops))
         if stops > 0
         else []
     )
-    base = 1000 / (pace * 60)      # metres per second
-    d, t, drift, out = 0.0, start_dt, 1.0, []
 
-    while d < total:
-        out.append((t, at(d)))
-        if stop_at and d >= stop_at[0]:
-            stop_at.pop(0)
-            for _ in range(random.randint(*DEFAULT_STOP_SECONDS)):
-                t += timedelta(seconds=1)
-                out.append((t, at(d)))        # same position, clock keeps running
-        drift = max(0.85, min(1.15, drift + random.uniform(-0.03, 0.03)))
-        d += base * drift
-        t += timedelta(seconds=1)
-    out.append((t, pts[-1]))
+    # 3. Base speed in meters per second
+    base_speed = 1000.0 / (pace_min_per_km * 60.0)
 
-    # Use output filename (cleaned) for GPX track name for documentation in Strava
-    activity_name = Path(dst).stem.replace("_", " ").replace("-", " ").title()
+    # 4. Simulation loop
+    current_dist = 0.0
+    current_time = start_time
+    pace_drift = 1.0
+    track_records: list[tuple[datetime, tuple[float, float]]] = []
+
+    while current_dist < total_dist:
+        coord = interpolate_coordinate(points, cum_dist, current_dist)
+        track_records.append((current_time, coord))
+
+        # Check for pause event
+        if stop_milestones and current_dist >= stop_milestones[0]:
+            stop_milestones.pop(0)
+            pause_duration = random.randint(*stop_seconds_range)
+            for _ in range(pause_duration):
+                current_time += timedelta(seconds=1)
+                track_records.append((current_time, coord))
+
+        # Update speed drift with small random step, bounded between 0.85 and 1.15
+        pace_drift = max(0.85, min(1.15, pace_drift + random.uniform(-0.03, 0.03)))
+        current_dist += base_speed * pace_drift
+        current_time += timedelta(seconds=1)
+
+    # Ensure final coordinate is explicitly recorded
+    track_records.append((current_time, points[-1]))
+    elapsed_duration = current_time - start_time
+
+    return track_records, total_dist, elapsed_duration
+
+
+def export_gpx(
+    track_records: list[tuple[datetime, tuple[float, float]]],
+    output_path: str | Path,
+    activity_name: str,
+) -> Path:
+    """Format and write simulated track records to a GPX 1.1 file.
+
+    Parameters:
+        track_records: List of (timestamp, (latitude, longitude)) records.
+        output_path: Destination file path.
+        activity_name: Track name embedded inside the <trk><name> GPX tag.
+
+    Returns:
+        Path object pointing to the written GPX file.
+    """
+    dest = Path(output_path)
+    if dest.parent and not dest.parent.exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<gpx version="1.1" creator="manual" xmlns="http://www.topografix.com/GPX/1/1">',
+        '<gpx version="1.1" creator="fakerun" xmlns="http://www.topografix.com/GPX/1/1">',
         f'<trk><name>{activity_name}</name><trkseg>',
     ]
-    for ts, (la, lo) in out:
-        lines.append(
-            f'<trkpt lat="{la:.6f}" lon="{lo:.6f}"><time>{ts.strftime("%Y-%m-%dT%H:%M:%SZ")}</time></trkpt>'
-        )
-    lines += ['</trkseg></trk></gpx>']
 
-    # Ensure target output directory exists if specified
-    out_dir = Path(dst).parent
-    if out_dir and not out_dir.exists():
-        out_dir.mkdir(parents=True, exist_ok=True)
+    for ts, (lat, lon) in track_records:
+        utc_str = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(f'<trkpt lat="{lat:.6f}" lon="{lon:.6f}"><time>{utc_str}</time></trkpt>')
 
-    with open(dst, "w", encoding="utf-8") as f:
+    lines.append('</trkseg></trk></gpx>')
+
+    with open(dest, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    print(f"\nSuccessfully generated '{dst}'!")
-    print(f"Track Name : {activity_name}")
-    print(f"Distance   : {total / 1000:.2f} km")
-    print(f"Elapsed    : {t - start_dt}")
-    print(f"Total Pts  : {len(out)}")
+    return dest
 
 
+def generate_fake_run(
+    source_gpx: str | Path,
+    destination_gpx: str | Path,
+    start_time: datetime,
+    pace_min_per_km: float = DEFAULT_PACE_MIN_PER_KM,
+    stops: int = 0,
+    activity_name: str | None = None,
+) -> SimulationResult:
+    """High-level entry point to execute the GPX fake run simulation.
+
+    Parameters:
+        source_gpx: Path to the template route GPX file.
+        destination_gpx: Path where the generated GPX file will be saved.
+        start_time: Starting timestamp (UTC-aware).
+        pace_min_per_km: Target running pace in min/km.
+        stops: Number of pauses during the run.
+        activity_name: Optional custom track name. Defaults to a title-cased
+                       version of the destination filename stem.
+
+    Returns:
+        SimulationResult containing activity statistics and file path.
+    """
+    dest_path = Path(destination_gpx)
+    if not activity_name:
+        activity_name = dest_path.stem.replace("_", " ").replace("-", " ").title()
+
+    points = parse_gpx_points(source_gpx)
+    track_records, total_meters, elapsed_time = simulate_run(
+        points=points,
+        start_time=start_time,
+        pace_min_per_km=pace_min_per_km,
+        stops=stops,
+    )
+
+    written_path = export_gpx(
+        track_records=track_records,
+        output_path=dest_path,
+        activity_name=activity_name,
+    )
+
+    return SimulationResult(
+        output_path=written_path,
+        activity_name=activity_name,
+        total_distance_km=total_meters / 1000.0,
+        elapsed_time=elapsed_time,
+        total_points=len(track_records),
+        start_time=start_time,
+        pace_min_per_km=pace_min_per_km,
+        stops_count=stops,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Direct Execution Support
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # If run directly as a script, forward to main.py's user interface
+    from main import main
     main()
