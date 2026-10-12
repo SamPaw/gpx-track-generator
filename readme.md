@@ -1,10 +1,10 @@
-# 🏃 Fake Run GPX Generator
+#  Fake Run GPX Generator
 
 A Python tool to generate realistic running activities from any route GPX file. Perfect for generating believable GPS activities with natural pace variations and pauses for platforms like Strava and Garmin Connect.
 
 ---
 
-## 🌟 How It Works
+##  How It Works
 
 1. **Plan your route**: Create and download a route `.gpx` file from [gpx.studio](https://gpx.studio) (or export any route from Strava/Komoot).
 2. **Run the script**: Launch `main.py` to enter your target route, desired start time, pace, and pause settings.
@@ -12,7 +12,7 @@ A Python tool to generate realistic running activities from any route GPX file. 
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Prerequisites
 
@@ -40,7 +40,7 @@ No external `pip` packages required! This project uses only the Python standard 
 
 ---
 
-## ⚡ Command-Line Usage (CLI Flags)
+##  Command-Line Usage (CLI Flags)
 
 You can also bypass the prompts and pass arguments directly:
 
@@ -60,7 +60,7 @@ python main.py -t route.gpx -o morning_run.gpx -s "2026-10-12 06:30" -p 5.5 --st
 
 ---
 
-## 🐍 Python API Usage
+##  Python API Usage
 
 You can also import and use the simulation engine in your own scripts:
 
@@ -81,7 +81,7 @@ print(f"Generated {result.total_distance_km:.2f} km in {result.elapsed_time}!")
 
 ---
 
-## 📁 Project Architecture
+##  Project Architecture
 
 - **`main.py`**: User interface handling interactive prompts, CLI arguments, input validation, and summary reporting.
 - **`fakerun.py`**: Core simulation engine handling Haversine distance math, track interpolation, dynamic pace drift (85%–115%), and GPX 1.1 XML generation.
